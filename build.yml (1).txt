@@ -1,0 +1,117 @@
+name: build-hoonbot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch RakNet (from RakSAMP)
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/YashasSamaga/RakSAMP /tmp/raksamp
+          mkdir -p raknet
+          cp -r /tmp/raksamp/raknet/. raknet/
+
+          # fix 1: MSVC-only rvalue binding that clang rejects
+          sed -i 's/ReadCompressed((float)c\([wxyz]\))/ReadCompressed(c\1)/g' raknet/BitStream.h
+
+          # fix 2: ARM is little-endian, Types.h only knows x86/ppc names
+          sed -i '101{/endian-ness/s/.*/# define HOST_ENDIAN_IS_LITTLE/}; 137{/endian-ness/s/.*/# define LITTLE_ENDIAN/}' raknet/Types.h
+
+          # fix 3: Windows is case-insensitive, Linux is not (rakpeer.h vs RakPeer.h ...)
+          for h in SAMP_VER.h RakPeerInterface.h; do
+            if [ -z "$(find raknet -iname "$h" | head -1)" ]; then
+              f=$(find /tmp/raksamp -iname "$h" | head -1)
+              if [ -n "$f" ]; then cp "$f" raknet/; echo "copied $f"; fi
+            fi
+          done
+          [ -f raknet/main.h ] || { echo "// stub" > raknet/main.h; echo "stubbed main.h"; }
+          for pass in 1 2 3; do
+            grep -rhoE '#include "[^"]+"' raknet hoonbot.cpp | sed -E 's/#include "(.*)"/\1/' | sort -u | while read inc; do
+              [ -e "raknet/$inc" ] && continue
+              base=$(basename "$inc")
+              match=$(find raknet -maxdepth 2 -iname "$base" | head -1)
+              if [ -n "$match" ]; then
+                mkdir -p "raknet/$(dirname "$inc")"
+                ln -sf "$(realpath "$match")" "raknet/$inc" && echo "linked $inc -> $match"
+              fi
+            done
+          done
+
+          # fix 4: Windows type names + cookie constant that RakPeer/SocketLayer expect
+          cat > raknet/hoon_compat.h << 'HEOF'
+          #pragma once
+          #include <stdint.h>
+          #include <string.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          typedef uint32_t DWORD;
+          typedef uint16_t WORD;
+          typedef unsigned char BYTE;
+          typedef char TCHAR;
+          #ifndef NETCODE_CONNCOOKIELULZ
+          #define NETCODE_CONNCOOKIELULZ 0x6969
+          #endif
+          #ifdef __cplusplus
+          extern unsigned int _uiRndSrvChallenge;
+          inline void Log(const char*, ...) {}
+          #endif
+          HEOF
+          sed -i 's/^          //' raknet/hoon_compat.h
+
+          # fix 5: gen_gpci (join-time hardware id) = exact copy of the WORKING RakSAMP client code,
+          # kept in the repo root as gpci.cpp (do NOT rebuild BIG_NUM_MUL by hand: a wrong formula makes
+          # a 47-48 char GPCI instead of 42-43 and the server kicks the bot right after join)
+          cp gpci.cpp raknet/gpci.cpp
+          wc -l raknet/gpci.cpp
+
+          # fix 6: SocketLayer encrypts outgoing datagrams via samp_netencr.h
+          sed -i '1i #include "samp_netencr.h"' raknet/SocketLayer.cpp
+
+          # fix 7: MSVC-only type name used in the datagram obfuscation code
+          sed -i 's/unsigned __int8/unsigned char/g; s/__int8/char/g' raknet/SAMP/samp_netencr.cpp
+
+          echo none > snippets.txt
+
+      - name: Configure and build
+        run: |
+          set -o pipefail
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 2>&1 | grep -v -i "deprecat" | tee build.log
+          # -k keeps going so ALL errors show up in one run
+          cmake --build build -j4 -- -k > full_build.log 2>&1 || true
+          grep -E "error|Error|undefined|fatal" full_build.log | head -150 | tee -a build.log || true
+          # the real success test: did the .so get produced?
+          ls -la build/libhoonbot.so
+
+      - name: Upload .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libhoonbot-${{ matrix.abi }}
+          path: build/libhoonbot.so
+          if-no-files-found: error
+
+      - name: Upload log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ matrix.abi }}
+          path: |
+            build.log
+            snippets.txt
+
+            
